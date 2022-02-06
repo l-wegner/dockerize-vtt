@@ -1,0 +1,456 @@
+#!/bin/bash
+
+# NOTE functions following the stack approch. First comes the return value.
+
+###
+#
+# Check external commands are available.
+#
+###
+
+# checking for required commands.
+ensure_command_exists () {
+   if ! command -v $1 &> /dev/null
+   then
+    echo "$1 could not be found"
+    exit
+  fi
+} 
+
+ensure_command_exists "docker"
+ensure_command_exists "wget"
+ensure_command_exists "date"
+
+
+###
+#
+# Global variables
+#
+###
+EXECUTION_TIME=$(date +%FT%T)
+echo "Using $EXECUTION_TIME for timestamps"
+declare VTT_IMAGE_NAME="vtt"
+echo "Naming docker images: $VTT_IMAGE_NAME"
+LISTEN_PORT=443
+echo "Public port will be: $LISTEN_PORT"
+DOCKER_IMAGE_PORT=30000
+VTT_DATA_IN_CONTAINER=/vtt/data
+VTT_VERSION_FILE=VTT_VERSION.txt
+echo "Storing vtt version data dir and backup at : $VTT_VERSION_FILE"
+VTT_SKIP_BACKUP_ON_SAME_VERSION=false
+SCRIPT_NAME=$0
+###
+#
+# Version <-> Archive name conversions.
+#
+# Assumption the downloaded archive's filename has this format 'FoundryVTT-<version>.zip
+# TODO howto ensure filename format?
+###
+
+###
+# Takes the archive filename and returns its version.
+# Param #1 RETURNing the version
+# Param $2 the archive filename
+###
+version_from_archive(){
+  if [ -z "$1" ]; then
+    echo "version_from_archive needing the output variable"
+    exit
+  fi
+  declare -n result=$1
+  if [ -z "$2" ]; then
+    echo "version_from_archive needing the archive's name"
+    exit
+  fi
+  echo "Extracting version from $2"
+  # Assumption the downloaded file name has this format 'FoundryVTT-<version>.zip
+  declare VTT_ZIP_NAME="FoundryVTT-"
+  declare VTT_ZIP_EXT=".zip"
+  result=${2##$VTT_ZIP_NAME}
+  result=${result%%$VTT_ZIP_EXT}
+}
+
+###
+# Takes the archive version and returns its filename.
+# Param #1 RETURNing the filename
+# Param $2 the archive version
+###
+archive_from_version(){
+  if [ -z "$1" ]; then
+    echo "version_from_archive needing the output variable"
+    exit
+  fi
+  declare -n result=$1
+    if [ -z "$2" ]; then
+    echo "version_from_archive needing the archive's name"
+    exit
+  fi
+  declare VTT_VERSION=$2
+  echo "Creating archive name for $VTT_VERSION"
+  # Assumption the downloaded file name has this format 'FoundryVTT-<version>.zip
+  declare VTT_ZIP_NAME="FoundryVTT-"
+  declare VTT_ZIP_EXT=".zip"
+  result=${VTT_ZIP_NAME}${VTT_VERSION}${VTT_ZIP_EXT}
+}
+
+# Download the zip and infer the version.
+# Param #1 RETURNing the downloaded filename and its version as an Associative list (`declare -A <varname>`)
+declare -A VTT_FILE
+# Param $2 the url 
+# Param $3 the versioning folder [optional]
+download_and_identify_version(){
+  ###
+  #
+  # Checks
+  #
+  ###
+  if [ -z "$1" ]; then
+    echo "download_and_identify_version needing the output variable"
+    exit
+  fi
+  declare -n result=$1
+  if [ -z "$2" ]; then
+    echo "download_and_identify_version needing the download link"
+    exit
+  fi
+  declare LINK=$2
+  declare VERSIONS=$3
+  if ! [ -w `pwd` ]; then
+    echo "cannot write to `pwd` for downloading"
+    exit
+  fi
+  if ! [ -z "$VERSIONS" ]; then
+    mkdir -p "$VERSION"
+  fi
+
+  ###
+  #
+  # Download
+  #
+  # using temp folder to find the downloaded file, whose name we do not know.
+  ###
+  declare TMP_FOLDER=tmp-$EXECUTION_TIME
+  if [ -d $TMP_FOLDER ]; then
+    echo "the folder `pwd`/$TMP_FOLDER exists already"
+    exit
+  fi
+  mkdir $TMP_FOLDER
+  wget -P $TMP_FOLDER $LINK
+  VTT_FILE="$(ls $TMP_FOLDER -1)"
+  mv $TMP_FOLDER/$VTT_FILE .
+  echo "Downloaded $VTT_FILE"
+  # this should not fail, because we moved the downloaded file outside of that folder
+  rmdir $TMP_FOLDER
+  declare VTT_VERSION
+  version_from_archive VTT_VERSION $VTT_FILE
+  echo "Downloaded VTT version: ${VTT_VERSION}"
+
+  ###
+  #
+  # fill return value
+  #
+  ###
+  result[filename]=$VTT_FILE
+  result[version]=$VTT_VERSION
+
+  # move file to versioning archive
+  if [ -z "$VERSIONS" ]; then
+    echo "Versioning folder not provided, leaving $VTT_FILE at `pwd`"
+  elif [ -w $VERSIONS ]; then
+    declare TARGET_FOLDER="$VERSIONS/${result[version]}"
+    echo "Storing the file at $TARGET_FOLDER/$VTT_FILE"
+    mkdir -p "$TARGET_FOLDER"
+    if ! [ -d "$TARGET_FOLDER" ]; then
+      echo "Cannot move $VTT_FILE because $TARGET_FOLDER is no directory"
+      exit
+    fi
+    mv -n $VTT_FILE "$TARGET_FOLDER"
+    if [ -f $VTT_FILE ]; then
+    	echo "Failed to move $VTT_FILE to $TARGET_FOLDER. Because the target exists already."
+    	exit
+    fi
+  else
+    echo "Versioning folder $VERSIONS not writable."
+    exit
+  fi
+}
+
+# Build a docker file and image with the previously fetched archive.
+# Param #1 RETURNing the docker image tag.
+# Param $2 the version of the archive.
+# Param $3 the versioning folder [optional]
+build_docker_file_and_image(){
+  ###
+  #
+  # Checks
+  #
+  ###
+  if [ -z "$1" ]; then
+    echo "build_docker_file_and_image needing the output variable"
+    exit
+  fi
+  declare -n result=$1
+  if [ -z "$2" ]; then
+    echo "build_docker_file_and_image needing version"
+    exit
+  fi
+  declare VTT_VERSION=$2
+  echo "Dockerizing version $2"
+  declare VERSIONS=$3
+  if ! [ -z "$VERSIONS" ]; then
+    mkdir -p "$VERSION"
+  fi
+
+  
+  declare VTT_FILE
+  archive_from_version VTT_FILE $VTT_VERSION
+
+  declare DOCKER_FILE=Dockerfile-${VTT_VERSION}
+
+  declare VTT_FILE_PATH
+  # Prefer archive at . over archive at $VERSIONS
+  echo "${VTT_FILE}"
+  if [ -f "${VTT_FILE}" ]; then
+    echo "Pointing to `pwd`/$VTT_FILE in the Dockerfile"
+    VTT_FILE_PATH="${VTT_FILE}"
+  elif [ -z "$VERSIONS" ]; then
+    declare VTT_FILE_AT_VERSIONS=$VERSIONS/$VTT_VERSION/$VTT_FILE
+    if [ -f "$VTT_FILE_AT_VERSIONS" ]; then
+      echo "Pointing to versions folder with $VTT_FILE_AT_VERSIONS in the Dockerfile"
+      VTT_FILE_PATH="$VTT_FILE_AT_VERSIONS"
+    fi
+  fi
+  ###
+  #
+  # Creating Dockerfile
+  #
+  ###
+  if [ -z "$VTT_FILE_PATH" ]; then
+    echo "Cannot find $VTT_FILE . Neither at `pwd` nor at versioning folder: $VERSIONS"
+    exit
+  fi
+  declare OUTPUT_PATH
+  if ! [ -z "$VERSIONS" ] && [ -w $VERSIONS ]; then
+    OUTPUT_PATH=$VERSIONS/$VTT_VERSION
+  elif [ -w `pwd` ]; then
+    OUTPUT_PATH=`pwd`  
+  else
+    echo "No write access. Neither at `pwd` nor at versioning folder: $VERSIONS"
+  fi
+  $DOCKER_FILE="$OUTPUT_PATH/$DOCKER_FILE"
+  echo "Creating Dockerfile: $DOCKER_FILE"
+
+  cat <<DOCKERFILE_CONTENT > "$DOCKER_FILE"
+# syntax=docker/dockerfile:1
+FROM node:17.4-alpine3.14
+
+EXPOSE ${DOCKER_IMAGE_PORT}
+WORKDIR /vtt/foundryvtt
+ADD --chown=node:node ./${VTT_FILE_PATH} .
+RUN apk add --no-cache --virtual .build-deps \
+	unzip \
+	&& unzip ${VTT_FILE} \
+	&& rm ${VTT_FILE} \
+	&& apk del .build-deps
+VOLUME $VTT_DATA_IN_CONTAINER
+WORKDIR /vtt
+RUN chown -R node:node /vtt
+
+USER node:node
+# allow containers to know their VTT_VERSION
+RUN echo "$VTT_VERSION" > $VTT_VERSION_FILE
+CMD ["node", "foundryvtt/resources/app/main.js", "--dataPath=$VTT_DATA_IN_CONTAINER"]
+DOCKERFILE_CONTENT
+
+  ###
+  #
+  # Build docker image
+  #
+  ###
+  declare DOCKER_TAG=$VTT_IMAGE_NAME:$VTT_VERSION
+  echo "Building docker image as $DOCKER_TAG"
+  docker build -f $DOCKER_FILE -t $DOCKER_TAG .
+#    DOCKER_BUILDKIT=1 docker build -f $DOCKER_FILE -t $DOCKER_TAG .
+  result=$DOCKER_TAG
+
+}
+
+
+# Backup the content of the given data_dir to the given backup_dir and updating the $VTT_VERSION_FILE at the given data_dir to the given new version.
+# Param $1 the new version, before which a backup should be applied
+# Param $2 the data_dir, whose content shall be backed up to <backup_dir>/<folder-name-of-the-data-dir>/<timestamp>
+# Param $3 the backup_dir
+backup_data_dir() {
+  ###
+  #
+  # Checks
+  #
+  ###
+  declare DATA_DIR=$1
+  if [ -z "$DATA_DIR" ] && ! [ -w "$DATA_DIR" ]; then
+    echo "backup_data_dir needing the writable data dir"
+    exit 1
+  fi
+  declare BACKUP_DIR=$2
+  mkdir -p $BACKUP_DIR
+  if [ -z "$BACKUP_DIR" ] && ! [ -w "$BACKUP_DIR" ]; then
+    echo "backup_data_dir needing the writable backup"
+    exit 1
+  fi
+  declare NEW_VTT_VERSION=$3
+  
+  ###
+  #
+  # Maybe skip backup on same given new version
+  #
+  ###
+  if ! [ -f "$DATA_DIR"/"$VTT_VERSION_FILE" ]; then
+    echo "Cannot read version from data dir $DATA_DIR. Creating a backup anyway."
+  else
+    declare CURRENT_VERSION=$(head -n 1 "$DATA_DIR"/"$VTT_VERSION_FILE")
+
+    if ! [ -z $NEW_VTT_VERSION ] && [ "$NEW_VTT_VERSION" = "$CURRENT_VERSION" ] && $VTT_SKIP_BACKUP_ON_SAME_VERSION 
+      # new version was given 
+      # and given version and version in data_dir are the same    
+      # and skipping backup is enabled 
+    then
+      echo "The passed (target version) and the version of the data dir are the same: $CURRENT_VERSION. Skipping backup."
+      return
+    fi
+  fi
+  ###
+  #
+  # Actual backup
+  #
+  ###
+  declare TARGET="$BACKUP_DIR/${VTT_DATA_DIR##*/}/$EXECUTION_TIME/"
+  mkdir -p "$TARGET"
+  shopt -s dotglob nullglob
+  cp -r -t "$TARGET" $(echo "$DATA_DIR/*")
+  ###
+  #
+  # Update the data_dir version to the given version
+  #
+  ###
+  if ! [ -z $NEW_VTT_VERSION ]; then
+    touch "$DATA_DIR"/"$VTT_VERSION_FILE"
+    echo $VTT_VERSION > "$DATA_DIR"/"$VTT_VERSION_FILE"
+  fi
+}
+# Starts a container from the image $VTT_IMAGE_NAME:<given_version> with the given data_dir. It aborts if the <given_version> does not match the version at <given_data> .
+# Param $1 the data_dir, whose content shall be backed up to <backup_dir>/<folder-name-of-the-data-dir>/<timestamp>
+# Param $2 the new version, before which a backup should be applied
+start_container() {
+  ###
+  #
+  # Checks
+  #
+  ###
+  declare DATA_DIR=$1
+  if [ -z "$DATA_DIR" ] && ! [ -w "$DATA_DIR" ]; then
+    echo "start_container needing the writable data dir"
+    exit 1
+  fi
+  declare VTT_VERSION=$2
+  if [ -z "$VTT_VERSION" ]; then
+    echo "start_container needing the VTT version"
+    exit 1
+  fi
+
+  ###
+  #
+  # Ensure the given version and the version of the data_dir match.
+  #
+  ###
+  if ! [ -f "$DATA_DIR"/"$VTT_VERSION_FILE" ]; then
+    echo "Cannot read version from data dir $DATA_DIR. Try executing 'touch $DATA_DIR/$VTT_VERSION_FILE; echo $VTT_VERSION > $DATA_DIR/$VTT_VERSION_FILE'"
+    exit
+  else
+    declare CURRENT_VERSION=$(head -n 1 "$DATA_DIR"/"$VTT_VERSION_FILE")
+    if [ "$VTT_VERSION" != "$CURRENT_VERSION" ]; then
+      echo "The passed version ($VTT_VERSION) and the version of the data dir ($CURRENT_VERSION) differ."
+      echo "Try running:  '$SCRIPT_NAME backup_and_start $VTT_VERSION ${VTT_DATA_DIR} <put your backup storage location here>'"
+      return
+    fi
+  fi
+  declare DOCKER_IMAGE_TAG=$VTT_IMAGE_NAME:$VTT_VERSION
+  declare DOCKER_CONTAINER_NAME=${VTT_DATA_DIR##*/}_${VTT_IMAGE_NAME}_${VTT_VERSION}
+  if [ ! "$(docker ps -qa -f name=$DOCKER_CONTAINER_NAME)" ]; then
+    echo "Creating container with the following command:"
+    echo "docker run -d \
+      --name $DOCKER_CONTAINER_NAME \
+      -p $LISTEN_PORT:$DOCKER_IMAGE_PORT \
+      --mount type=bind,source=$(realpath ${VTT_DATA_DIR}/),target=$VTT_DATA_IN_CONTAINER\
+      $DOCKER_IMAGE_TAG"
+    docker run -d\
+      --name $DOCKER_CONTAINER_NAME \
+      -p $LISTEN_PORT:$DOCKER_IMAGE_PORT\
+      --mount type=bind,source=$(realpath ${VTT_DATA_DIR}/),target=$VTT_DATA_IN_CONTAINER\
+      "$DOCKER_IMAGE_TAG"
+    exit
+  elif [ $(docker ps -aq -f status=exited -f name=$DOCKER_CONTAINER_NAME) ]; then
+    echo "A docker container with name $DOCKER_CONTAINER_NAME already exists, but it's stopped."
+    echo "If you want to start it, execute: 'docker start $DOCKER_CONTAINER_NAME'"
+    echo "To remove the existing container: 'docker rm $DOCKER_CONTAINER_NAME'"
+    # TODO add rerun command
+    exit
+  elif [ $(docker ps -aq -f status=running -f name=$DOCKER_CONTAINER_NAME) ]; then
+    echo "A docker container with name $DOCKER_CONTAINER_NAME already exists, and is running."
+    echo "If you want replace that container with one from this script's image, remove the existing first and rerun this script with identical parameters."
+    echo "To remove the existing container: 'docker stop $DOCKER_CONTAINER_NAME; docker rm $DOCKER_CONTAINER_NAME'"
+    # TODO add rerun command
+    exit
+  else
+    echo "There is a docker container named $DOCKER_CONTAINER_NAME, but its state is unknown to this script."
+    exit 1
+  fi
+}
+
+backup_and_start() {
+  ###
+  #
+  # Checks
+  #
+  ###
+  if [ -z "$1" ]; then
+    echo "backup_and_start needing the new VTT version"
+    exit 1
+  fi
+  if [ -z "$2" ] && ! [ -w "$2" ]; then
+    echo "backup_and_start needing the writable data dir"
+    exit 1
+  fi
+  if [ -z "$3" ] && ! [ -w "$3" ]; then
+    echo "backup_and_start needing the writable backup"
+    exit 1
+  fi
+  declare VTT_VERSION=$1
+  declare DATA_DIR=$2
+  declare BACKUP_DIR=$3
+  backup_data_dir ${VTT_DATA_DIR} $VTT_BACKUP ${VTT_VERSION} 
+  start_container ${VTT_DATA_DIR} ${VTT_VERSION}
+}
+
+# TODO introduce a param at the beginning to make separate steps.
+
+# TODO check if param $1 is available
+VTT_DL_LINK=$1
+# TODO check if param $2 is available and a writable directory
+VTT_DATA_DIR=$2
+# TODO check if param $3 is available and a writable directory
+VTT_BACKUP=$3
+# TODO check if param $4 is a writable directory if given.
+VTT_VERSIONING=$4
+
+download_and_identify_version VTT_FILE $VTT_DL_LINK $VTT_VERSIONING
+echo "Archive version: ${VTT_FILE[version]} name: ${VTT_FILE[filename]}"
+
+declare DOCKER_IMAGE_TAG
+build_docker_file_and_image DOCKER_IMAGE_TAG ${VTT_FILE[version]} $VTT_VERSIONING
+
+echo "Created docker image $DOCKER_IMAGE_TAG"
+
+backup_and_start ${VTT_FILE[version]} ${VTT_DATA_DIR} $VTT_BACKUP 
+exit
+
+
